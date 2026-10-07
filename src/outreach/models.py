@@ -21,6 +21,21 @@ CompanyStatus = Literal[
     "failed",
     "do_not_contact",
 ]
+ContactRouteType = Literal[
+    "recruiting_email",
+    "careers_email",
+    "talent_email",
+    "hiring_email",
+    "hr_email",
+    "general_email",
+    "careers_form",
+    "contact_form",
+    "careers_page",
+    "contact_page",
+    "other",
+]
+ContactRouteStatus = Literal["active", "invalid", "stale", "blocked", "unknown"]
+DiscoveryStatus = Literal["pending", "success", "no_routes", "failed"]
 
 CONTACT_TYPES = (
     "recruiting",
@@ -40,6 +55,21 @@ COMPANY_STATUSES = (
     "failed",
     "do_not_contact",
 )
+CONTACT_ROUTE_TYPES = (
+    "recruiting_email",
+    "careers_email",
+    "talent_email",
+    "hiring_email",
+    "hr_email",
+    "general_email",
+    "careers_form",
+    "contact_form",
+    "careers_page",
+    "contact_page",
+    "other",
+)
+CONTACT_ROUTE_STATUSES = ("active", "invalid", "stale", "blocked", "unknown")
+DISCOVERY_STATUSES = ("pending", "success", "no_routes", "failed")
 
 
 def utc_now() -> datetime:
@@ -82,3 +112,32 @@ class Company:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class ContactRoute:
+    company_id: int
+    route_type: ContactRouteType
+    value: str
+    id: int | None = None
+    source_url: str | None = None
+    source_type: str = "public_website"
+    confidence: float = 0.5
+    verified: bool = False
+    discovered_at: datetime = field(default_factory=utc_now)
+    last_checked_at: datetime = field(default_factory=utc_now)
+    status: ContactRouteStatus = "active"
+    notes: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ContactDiscoveryState:
+    company_id: int
+    last_discovery_at: datetime
+    discovery_status: DiscoveryStatus
+    pages_checked: int = 0
+    routes_found: int = 0
+    error_message: str | None = None

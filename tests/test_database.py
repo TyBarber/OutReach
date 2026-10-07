@@ -176,4 +176,6 @@ def test_stats(tmp_path):
         "replied": 0,
         "failed": 1,
         "do_not_contact": 0,
+        "source_records": 0,
+        "ingestion_runs": 0,
     }

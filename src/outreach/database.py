@@ -1,4 +1,3 @@
-import csv
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -30,6 +29,20 @@ class ImportSummary:
     invalid: int = 0
 
 
+@dataclass(frozen=True)
+class IngestionHistory:
+    id: int
+    source_name: str
+    source_identifier: str | None
+    started_at: datetime
+    completed_at: datetime | None
+    processed: int
+    imported: int
+    duplicates: int
+    filtered: int
+    invalid: int
+
+
 def normalize_domain(value: str | None) -> str | None:
     """Return a lowercase hostname without www, port, path, or query data."""
     if not value or not value.strip():
@@ -42,7 +55,17 @@ def normalize_domain(value: str | None) -> str | None:
     hostname = hostname.rstrip(".").lower()
     if hostname.startswith("www."):
         hostname = hostname[4:]
-    return hostname or None
+    try:
+        hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    if not re.fullmatch(
+        r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+        hostname,
+    ):
+        return None
+    return hostname
 
 
 def normalize_company_name(value: str) -> str:
@@ -99,6 +122,73 @@ def _create_companies_table(connection: sqlite3.Connection) -> None:
     )
 
 
+def _create_ingestion_tables(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS company_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+            source_name TEXT NOT NULL,
+            source_identifier TEXT NOT NULL DEFAULT '',
+            discovered_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            UNIQUE(company_id, source_name, source_identifier)
+        )
+        """
+    )
+
+
+def _create_contact_tables(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS contact_routes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+            route_type TEXT NOT NULL,
+            value TEXT NOT NULL COLLATE NOCASE,
+            source_url TEXT,
+            source_type TEXT NOT NULL DEFAULT 'public_website',
+            confidence REAL NOT NULL DEFAULT 0.5,
+            verified INTEGER NOT NULL DEFAULT 0,
+            discovered_at TEXT NOT NULL,
+            last_checked_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            notes TEXT,
+            UNIQUE(company_id, route_type, value)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS contact_discovery_state (
+            company_id INTEGER PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+            last_discovery_at TEXT NOT NULL,
+            discovery_status TEXT NOT NULL,
+            pages_checked INTEGER NOT NULL DEFAULT 0,
+            routes_found INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ingestion_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_name TEXT NOT NULL,
+            source_identifier TEXT,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            processed INTEGER NOT NULL DEFAULT 0,
+            imported INTEGER NOT NULL DEFAULT 0,
+            duplicates INTEGER NOT NULL DEFAULT 0,
+            filtered INTEGER NOT NULL DEFAULT 0,
+            invalid INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+
+
 def _migrate_legacy_table(connection: sqlite3.Connection) -> None:
     columns = {
         row["name"]: row for row in connection.execute("PRAGMA table_info(companies)")
@@ -136,6 +226,8 @@ def initialize_database(database_path: Path = DATABASE_PATH) -> Path:
     try:
         _create_companies_table(connection)
         _migrate_legacy_table(connection)
+        _create_ingestion_tables(connection)
+        _create_contact_tables(connection)
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS ux_companies_domain "
             "ON companies(domain) WHERE domain IS NOT NULL"
@@ -146,6 +238,26 @@ def initialize_database(database_path: Path = DATABASE_PATH) -> Path:
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS ix_companies_status ON companies(status)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS ix_company_sources_company "
+            "ON company_sources(company_id)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS ix_ingestion_history_source "
+            "ON ingestion_history(source_name)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS ix_contact_routes_company_status "
+            "ON contact_routes(company_id, status)"
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_contact_routes_company_value "
+            "ON contact_routes(company_id, value)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS ix_discovery_state_status "
+            "ON contact_discovery_state(discovery_status, last_discovery_at)"
         )
         connection.commit()
     finally:
@@ -237,6 +349,166 @@ def get_company(company_id: int, database_path: Path = DATABASE_PATH) -> Company
         connection.close()
 
 
+def find_company_id(
+    company: Company, database_path: Path = DATABASE_PATH
+) -> int | None:
+    initialize_database(database_path)
+    domain = normalize_domain(company.domain or company.website)
+    connection = get_connection(database_path)
+    try:
+        if domain:
+            row = connection.execute(
+                "SELECT id FROM companies WHERE domain = ?", (domain,)
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT id FROM companies WHERE normalized_name = ? LIMIT 1",
+                (normalize_company_name(company.name),),
+            ).fetchone()
+        return int(row["id"]) if row else None
+    finally:
+        connection.close()
+
+
+def add_company_source(
+    company_id: int,
+    source_name: str,
+    source_identifier: str | None = None,
+    database_path: Path = DATABASE_PATH,
+) -> None:
+    initialize_database(database_path)
+    connection = get_connection(database_path)
+    try:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO company_sources (
+                company_id, source_name, source_identifier
+            ) VALUES (?, ?, ?)
+            """,
+            (company_id, source_name, source_identifier or ""),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def list_company_sources(
+    company_id: int, database_path: Path = DATABASE_PATH
+) -> list[dict[str, Any]]:
+    initialize_database(database_path)
+    connection = get_connection(database_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT source_name, source_identifier, discovered_at
+            FROM company_sources
+            WHERE company_id = ?
+            ORDER BY id
+            """,
+            (company_id,),
+        ).fetchall()
+        return [
+            {
+                "source_name": row["source_name"],
+                "source_identifier": row["source_identifier"] or None,
+                "discovered_at": _parse_timestamp(row["discovered_at"]),
+            }
+            for row in rows
+        ]
+    finally:
+        connection.close()
+
+
+def start_ingestion(
+    source_name: str,
+    source_identifier: str | None = None,
+    database_path: Path = DATABASE_PATH,
+) -> int:
+    initialize_database(database_path)
+    connection = get_connection(database_path)
+    try:
+        cursor = connection.execute(
+            """
+            INSERT INTO ingestion_history (
+                source_name, source_identifier, started_at
+            ) VALUES (?, ?, ?)
+            """,
+            (
+                source_name,
+                source_identifier,
+                _format_timestamp(datetime.now(timezone.utc)),
+            ),
+        )
+        connection.commit()
+        if cursor.lastrowid is None:
+            raise RuntimeError("SQLite did not return an ingestion ID.")
+        return cursor.lastrowid
+    finally:
+        connection.close()
+
+
+def complete_ingestion(
+    ingestion_id: int,
+    *,
+    processed: int,
+    imported: int,
+    duplicates: int,
+    filtered: int,
+    invalid: int,
+    database_path: Path = DATABASE_PATH,
+) -> None:
+    connection = get_connection(database_path)
+    try:
+        connection.execute(
+            """
+            UPDATE ingestion_history
+            SET completed_at = ?, processed = ?, imported = ?,
+                duplicates = ?, filtered = ?, invalid = ?
+            WHERE id = ?
+            """,
+            (
+                _format_timestamp(datetime.now(timezone.utc)),
+                processed,
+                imported,
+                duplicates,
+                filtered,
+                invalid,
+                ingestion_id,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def list_ingestion_history(
+    database_path: Path = DATABASE_PATH,
+) -> list[IngestionHistory]:
+    initialize_database(database_path)
+    connection = get_connection(database_path)
+    try:
+        rows = connection.execute(
+            "SELECT * FROM ingestion_history ORDER BY id DESC"
+        ).fetchall()
+        return [
+            IngestionHistory(
+                id=row["id"],
+                source_name=row["source_name"],
+                source_identifier=row["source_identifier"],
+                started_at=_parse_timestamp(row["started_at"]),
+                completed_at=_parse_timestamp(row["completed_at"]),
+                processed=row["processed"],
+                imported=row["imported"],
+                duplicates=row["duplicates"],
+                filtered=row["filtered"],
+                invalid=row["invalid"],
+            )
+            for row in rows
+        ]
+    finally:
+        connection.close()
+
+
 def list_companies(
     *,
     status: CompanyStatus | None = None,
@@ -250,9 +522,19 @@ def list_companies(
         conditions.append("status = ?")
         parameters.append(status)
     if has_contact is True:
-        conditions.append("contact_email IS NOT NULL AND trim(contact_email) <> ''")
+        conditions.append(
+            "((contact_email IS NOT NULL AND trim(contact_email) <> '') "
+            "OR EXISTS (SELECT 1 FROM contact_routes "
+            "WHERE contact_routes.company_id = companies.id "
+            "AND contact_routes.status = 'active'))"
+        )
     elif has_contact is False:
-        conditions.append("(contact_email IS NULL OR trim(contact_email) = '')")
+        conditions.append(
+            "(contact_email IS NULL OR trim(contact_email) = '') "
+            "AND NOT EXISTS (SELECT 1 FROM contact_routes "
+            "WHERE contact_routes.company_id = companies.id "
+            "AND contact_routes.status = 'active')"
+        )
     where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
     connection = get_connection(database_path)
     try:
@@ -356,13 +638,29 @@ def get_stats(database_path: Path = DATABASE_PATH) -> dict[str, int]:
             SELECT
                 count(*) AS total,
                 sum(status = 'discovered') AS discovered,
-                sum(contact_email IS NOT NULL AND trim(contact_email) <> '') AS with_contacts,
-                sum(contact_email IS NULL OR trim(contact_email) = '') AS without_contacts,
+                sum(
+                    (contact_email IS NOT NULL AND trim(contact_email) <> '')
+                    OR EXISTS (
+                        SELECT 1 FROM contact_routes
+                        WHERE contact_routes.company_id = companies.id
+                          AND contact_routes.status = 'active'
+                    )
+                ) AS with_contacts,
+                sum(
+                    (contact_email IS NULL OR trim(contact_email) = '')
+                    AND NOT EXISTS (
+                        SELECT 1 FROM contact_routes
+                        WHERE contact_routes.company_id = companies.id
+                          AND contact_routes.status = 'active'
+                    )
+                ) AS without_contacts,
                 sum(status = 'queued') AS queued,
                 sum(status = 'sent') AS sent,
                 sum(status = 'replied') AS replied,
                 sum(status = 'failed') AS failed,
-                sum(status = 'do_not_contact') AS do_not_contact
+                sum(status = 'do_not_contact') AS do_not_contact,
+                (SELECT count(*) FROM company_sources) AS source_records,
+                (SELECT count(*) FROM ingestion_history) AS ingestion_runs
             FROM companies
             """
         ).fetchone()
@@ -375,29 +673,7 @@ def import_companies_csv(
     csv_path: Path,
     database_path: Path = DATABASE_PATH,
 ) -> ImportSummary:
-    imported = duplicates = invalid = 0
-    with csv_path.open(newline="", encoding="utf-8-sig") as file:
-        reader = csv.DictReader(file)
-        if not reader.fieldnames or "name" not in reader.fieldnames:
-            raise ValueError("CSV must contain a 'name' column.")
-        for row in reader:
-            try:
-                name = (row.get("name") or "").strip()
-                if not name:
-                    raise ValueError("Company name is required.")
-                contact_type = (row.get("contact_type") or "").strip() or None
-                company = Company(
-                    name=name,
-                    website=(row.get("website") or "").strip() or None,
-                    domain=(row.get("domain") or "").strip() or None,
-                    careers_url=(row.get("careers_url") or "").strip() or None,
-                    contact_email=(row.get("contact_email") or "").strip() or None,
-                    contact_type=contact_type,
-                )
-                add_company(company, database_path)
-                imported += 1
-            except DuplicateCompanyError:
-                duplicates += 1
-            except (TypeError, ValueError):
-                invalid += 1
-    return ImportSummary(imported, duplicates, invalid)
+    from outreach.ingestion import CSVCompanySource, ingest_source
+
+    summary = ingest_source(CSVCompanySource(csv_path), database_path=database_path)
+    return ImportSummary(summary.imported, summary.duplicates, summary.invalid)

@@ -3,6 +3,13 @@ import json
 from pathlib import Path
 
 from outreach.config import profile_path
+from outreach.contacts import (
+    discover_company_contacts,
+    discover_contacts_batch,
+    get_best_contact_route,
+    get_contact_stats,
+    list_contact_routes,
+)
 from outreach.database import (
     DuplicateCompanyError,
     add_company,
@@ -11,7 +18,17 @@ from outreach.database import (
     get_stats,
     import_companies_csv,
     list_companies,
+    list_company_sources,
+    list_ingestion_history,
     set_company_status,
+)
+from outreach.ingestion import (
+    CSVCompanySource,
+    DomainTextSource,
+    JSONCompanySource,
+    ProfileTargetFilter,
+    SECCompanySource,
+    ingest_source,
 )
 from outreach.models import CONTACT_TYPES, Company
 from outreach.onboarding import run_onboarding
@@ -104,6 +121,12 @@ def cmd_company_show(company_id: int) -> int:
     values = company.to_dict()
     for key, value in values.items():
         print(f"{key}: {value}")
+    sources = list_company_sources(company_id)
+    if sources:
+        print("sources:")
+        for source in sources:
+            identifier = source["source_identifier"] or "-"
+            print(f"  {source['source_name']}: {identifier}")
     return 0
 
 
@@ -143,8 +166,139 @@ def cmd_stats() -> int:
         "replied": "Replied",
         "failed": "Failed",
         "do_not_contact": "Do not contact",
+        "source_records": "Source records",
+        "ingestion_runs": "Ingestion runs",
     }
     stats = get_stats()
+    for key, label in labels.items():
+        print(f"{label}: {stats[key]}")
+    return 0
+
+
+def _profile_filter(enabled: bool) -> ProfileTargetFilter | None:
+    if not enabled:
+        return None
+    return ProfileTargetFilter(load_profile(profile_path()))
+
+
+def _print_ingestion_summary(summary) -> None:
+    print(f"Source: {summary.source}")
+    print(f"Processed: {summary.processed}")
+    print(f"Imported: {summary.imported}")
+    print(f"Duplicates: {summary.duplicates}")
+    print(f"Filtered: {summary.filtered}")
+    print(f"Invalid: {summary.invalid}")
+
+
+def cmd_ingest(args: argparse.Namespace) -> int:
+    if args.ingest_command == "history":
+        history = list_ingestion_history()
+        if not history:
+            print("No ingestion history found.")
+            return 0
+        print("ID  Source               Processed  Imported  Duplicates  Filtered  Invalid")
+        for item in history:
+            print(
+                f"{item.id:<3} {item.source_name:<20} {item.processed:<10} "
+                f"{item.imported:<9} {item.duplicates:<11} "
+                f"{item.filtered:<9} {item.invalid}"
+            )
+        return 0
+
+    source_types = {
+        "csv": CSVCompanySource,
+        "domains": DomainTextSource,
+        "json": JSONCompanySource,
+        "sec": SECCompanySource,
+    }
+    try:
+        source = source_types[args.ingest_command](Path(args.path))
+        summary = ingest_source(
+            source,
+            company_filter=_profile_filter(args.filter_profile),
+        )
+    except (FileNotFoundError, OSError, ValueError) as error:
+        print(f"Error: {error}")
+        return 1
+    _print_ingestion_summary(summary)
+    return 0
+
+
+def _print_routes(routes) -> None:
+    if not routes:
+        print("No contact routes found.")
+        return
+    for route in routes:
+        verified = "verified" if route.verified else "unverified"
+        print(f"{route.route_type}: {route.value} ({verified}, {route.status})")
+
+
+def cmd_contacts(args: argparse.Namespace) -> int:
+    if args.contacts_command == "discover":
+        try:
+            result = discover_company_contacts(
+                args.id,
+                page_budget=args.page_budget,
+                request_delay=args.delay,
+            )
+        except ValueError as error:
+            print(f"Error: {error}")
+            return 1
+        print(f"Company: {result.company_name}")
+        print(f"Status: {result.status}")
+        print(f"Pages checked: {result.pages_checked}")
+        print("Found:")
+        _print_routes(result.routes)
+        best = get_best_contact_route(args.id)
+        print(f"Best route: {best.value if best else 'None'}")
+        if result.error_message:
+            print(f"Notes: {result.error_message}")
+        return 0 if result.status != "failed" else 1
+
+    if args.contacts_command == "discover-all":
+        summary = discover_contacts_batch(
+            limit=args.limit,
+            retry_failed=args.retry_failed,
+            page_budget=args.page_budget,
+            request_delay=args.delay,
+            company_delay=args.company_delay,
+        )
+        print(f"Companies processed: {summary.processed}")
+        print(f"Successes: {summary.successes}")
+        print(f"No routes: {summary.no_routes}")
+        print(f"Failures: {summary.failures}")
+        print(f"Routes discovered: {summary.routes_discovered}")
+        return 0
+
+    if args.contacts_command == "list":
+        if get_company(args.id) is None:
+            print(f"Company {args.id} not found.")
+            return 1
+        _print_routes(list_contact_routes(args.id))
+        return 0
+
+    if args.contacts_command == "best":
+        if get_company(args.id) is None:
+            print(f"Company {args.id} not found.")
+            return 1
+        route = get_best_contact_route(args.id)
+        if route is None:
+            print("No active contact route found.")
+            return 1
+        print(f"{route.route_type}: {route.value}")
+        return 0
+
+    labels = {
+        "total_routes": "Total routes",
+        "active_routes": "Active routes",
+        "verified_routes": "Verified routes",
+        "companies_with_routes": "Companies with routes",
+        "email_routes": "Email routes",
+        "form_routes": "Form routes",
+        "page_routes": "Page routes",
+        "companies_checked": "Companies checked",
+    }
+    stats = get_contact_stats()
     for key, label in labels.items():
         print(f"{label}: {stats[key]}")
     return 0
@@ -173,12 +327,54 @@ def _add_company_commands(sub: argparse._SubParsersAction) -> None:
     importer.add_argument("csv_path")
 
 
+def _add_ingest_commands(sub: argparse._SubParsersAction) -> None:
+    ingest = sub.add_parser("ingest", help="Ingest companies from source files")
+    ingest_sub = ingest.add_subparsers(dest="ingest_command", required=True)
+    for command, help_text in (
+        ("csv", "Import a company CSV file"),
+        ("domains", "Import a domain-per-line text file"),
+        ("json", "Import structured company JSON"),
+        ("sec", "Import the SEC company_tickers.json dataset"),
+    ):
+        source = ingest_sub.add_parser(command, help=help_text)
+        source.add_argument("path")
+        source.add_argument(
+            "--filter-profile",
+            action="store_true",
+            help="Apply conservative filtering using the saved candidate profile",
+        )
+    ingest_sub.add_parser("history", help="Show ingestion history")
+
+
+def _add_contact_commands(sub: argparse._SubParsersAction) -> None:
+    contacts = sub.add_parser("contacts", help="Discover public contact routes")
+    contacts_sub = contacts.add_subparsers(dest="contacts_command", required=True)
+    discover = contacts_sub.add_parser("discover", help="Discover one company")
+    discover.add_argument("id", type=int)
+    discover.add_argument("--page-budget", type=int, default=4)
+    discover.add_argument("--delay", type=float, default=0.25)
+    discover_all = contacts_sub.add_parser(
+        "discover-all", help="Discover a bounded company batch"
+    )
+    discover_all.add_argument("--limit", type=int, default=50)
+    discover_all.add_argument("--retry-failed", action="store_true")
+    discover_all.add_argument("--page-budget", type=int, default=4)
+    discover_all.add_argument("--delay", type=float, default=0.25)
+    discover_all.add_argument("--company-delay", type=float, default=0.5)
+    for command in ("list", "best"):
+        parser = contacts_sub.add_parser(command, help=f"{command.title()} contact routes")
+        parser.add_argument("id", type=int)
+    contacts_sub.add_parser("stats", help="Show contact discovery statistics")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="outreach")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="Answer onboarding questions and save your profile")
     sub.add_parser("show", help="Print your saved profile")
     _add_company_commands(sub)
+    _add_ingest_commands(sub)
+    _add_contact_commands(sub)
     queue = sub.add_parser("queue", help="Manage the outreach queue")
     queue_sub = queue.add_subparsers(dest="queue_command", required=True)
     queue_sub.add_parser("list", help="List queued companies")
@@ -193,6 +389,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_stats()
     if args.command == "queue":
         return cmd_queue_list()
+    if args.command == "ingest":
+        return cmd_ingest(args)
+    if args.command == "contacts":
+        return cmd_contacts(args)
     if args.company_command == "add":
         return cmd_company_add()
     if args.company_command == "list":
