@@ -1,34 +1,49 @@
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
-from uuid import uuid4
 
 
 ContactType = Literal[
-    "recruiting", 
-    "careers", 
-    "talent", 
-    "hr", 
-    "hiring", 
-    "general", 
+    "recruiting",
+    "careers",
+    "talent",
+    "hr",
+    "hiring",
+    "general",
     "other",
 ]
-
 CompanyStatus = Literal[
-    "discovered", 
+    "discovered",
     "contact_found",
-    "queued", 
-    "sent", 
-    "replied", 
-    "failed", 
-    "do_not_contact", 
+    "queued",
+    "sent",
+    "replied",
+    "failed",
+    "do_not_contact",
 ]
+
+CONTACT_TYPES = (
+    "recruiting",
+    "careers",
+    "talent",
+    "hr",
+    "hiring",
+    "general",
+    "other",
+)
+COMPANY_STATUSES = (
+    "discovered",
+    "contact_found",
+    "queued",
+    "sent",
+    "replied",
+    "failed",
+    "do_not_contact",
+)
 
 
 def utc_now() -> datetime:
-    """Return the current time as a timezone-aware UTC datetime."""
     return datetime.now(timezone.utc)
-
 
 
 @dataclass
@@ -43,7 +58,7 @@ class Profile:
     tone: str
     resume_path: str | None = None
 
-    def to_dict(self) -> dict[str,Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
@@ -54,8 +69,8 @@ class Profile:
 @dataclass
 class Company:
     name: str
-    domain: str
-    id: str = field(default_factory=lambda: str(uuid4()))
+    domain: str | None = None
+    id: int | None = None
     website: str | None = None
     careers_url: str | None = None
     contact_email: str | None = None
@@ -64,7 +79,6 @@ class Company:
     last_contacted_at: datetime | None = None
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
-
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

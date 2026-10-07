@@ -7,3 +7,8 @@ build/
 dist/
 .DS_Store
 data/*.db
+.env
+profile.json
+*.pdf
+*.doc
+*.docx
